@@ -3,9 +3,9 @@
 crypto_utils.py — Cryptographic primitives for secure-p2p
 
 Stage 2: Diffie-Hellman key exchange implemented from scratch.
-Every mathematical operation is commented so you can explain it in an interview.
+Stage 3: AES-256-CBC encryption and decryption.
 
-Stage 3 will add: AES-256-CBC encryption / decryption using the derived key.
+Every mathematical operation is commented so you can explain it in an interview.
 """
 
 import os
@@ -23,8 +23,6 @@ import struct
 #    prevents certain subgroup attacks against DH.
 #
 # g: the generator, 2. Every possible shared secret is a power of g mod p.
-#    The choice of g=2 with this specific p is proven to produce a group
-#    of prime order, meaning no small-subgroup attacks are possible.
 
 DH_PRIME_P = int(
     "FFFFFFFF FFFFFFFF C90FDAA2 2168C234 C4C6628B 80DC1CD1"
@@ -38,10 +36,13 @@ DH_PRIME_P = int(
     "E39E772C 180E8603 9B2783A2 EC07A28F B5C55DF0 6F4C52C9"
     "DE2BCBF6 95581718 3995497C EA956AE5 15D22618 98FA0510"
     "15728E5A 8AACAA68 FFFFFFFF FFFFFFFF".replace(" ", ""),
-    16  # Parse as hexadecimal
+    16
 )
 
 DH_GENERATOR_G = 2
+
+# AES block size is always 16 bytes — this is fixed by the AES standard
+AES_BLOCK_SIZE = 16
 
 
 # ─── Diffie-Hellman Key Exchange ──────────────────────────────────────────────
@@ -50,124 +51,52 @@ class DiffieHellman:
     """
     Manual implementation of Diffie-Hellman key exchange over a 2048-bit
     safe prime group (RFC 3526, Group 14).
-
-    Usage:
-        dh = DiffieHellman()
-        my_public_key  = dh.get_public_key()   # Send this to the other peer
-        shared_secret  = dh.compute_shared_secret(their_public_key)
-        aes_key        = dh.derive_aes_key(shared_secret)
     """
 
     def __init__(self):
         # Generate a cryptographically random private key.
-        #
-        # os.urandom(256) gives us 256 bytes = 2048 bits of OS-level randomness.
-        # int.from_bytes() converts those bytes to a large integer.
-        # The private key must stay secret — it never leaves this machine.
+        # os.urandom(256) gives 256 bytes = 2048 bits of OS-level randomness.
         self._private_key: int = int.from_bytes(os.urandom(256), byteorder="big")
-
-        # Clamp the private key to be in range [2, p-2].
-        # This is a safety measure — the extreme values 0, 1, p-1 produce
-        # degenerate public keys that leak information.
+        # Clamp to [2, p-2] to avoid degenerate values
         self._private_key = (self._private_key % (DH_PRIME_P - 2)) + 2
 
     def get_public_key(self) -> int:
         """
-        Compute and return our public key.
-
-        Formula: public_key = g^private_key mod p
-
-        Python's built-in pow(g, private_key, p) uses fast modular
-        exponentiation (square-and-multiply). This is O(log n) multiplications
-        instead of O(n) — essential because private_key is ~2048 bits.
-
-        The public key is SAFE TO SEND over the network in plaintext.
-        An eavesdropper seeing g, p, and g^a mod p still cannot determine 'a'
-        without solving the discrete logarithm problem.
+        Compute our public key: g^private_key mod p
+        Python's pow(g, e, m) uses fast modular exponentiation — O(log n).
         """
         return pow(DH_GENERATOR_G, self._private_key, DH_PRIME_P)
 
     def compute_shared_secret(self, their_public_key: int) -> int:
         """
-        Compute the shared secret using the other peer's public key.
-
-        Formula: shared_secret = their_public_key^our_private_key mod p
-                               = (g^their_private)^our_private mod p
-                               = g^(their_private * our_private) mod p
-
-        The other peer computes:
-                               = (g^our_private)^their_private mod p
-                               = g^(our_private * their_private) mod p
-
-        These are equal because multiplication is commutative.
-        This equality is the entire foundation of Diffie-Hellman.
-
-        We validate their public key first — accepting a malicious key
-        (like 1 or p-1) could allow an attacker to force the shared
-        secret to a predictable value.
+        Compute shared secret: their_public_key^our_private_key mod p
+        Both sides arrive at g^(a*b) mod p independently.
         """
         self._validate_public_key(their_public_key)
         return pow(their_public_key, self._private_key, DH_PRIME_P)
 
     def derive_aes_key(self, shared_secret: int) -> bytes:
         """
-        Derive a 256-bit AES key from the raw DH shared secret.
-
-        Why not use the shared secret directly as the AES key?
-        Two reasons:
-          1. The shared secret is a 2048-bit integer — AES needs exactly 256 bits.
-          2. The shared secret has mathematical structure (it's a group element).
-             Hashing it with SHA-256 produces a uniformly random-looking 256-bit
-             value with no exploitable structure.
-
-        This operation is called a Key Derivation Function (KDF).
-        A production system would use HKDF (RFC 5869) with a salt and info
-        string for domain separation — SHA-256 is sufficient for our purposes.
-
-        Returns:
-            32 bytes (256 bits) suitable for use as an AES-256 key.
+        Derive a 256-bit AES key from the raw DH shared secret via SHA-256.
+        SHA-256 removes mathematical structure and produces uniform 32 bytes.
         """
-        # Convert the shared secret integer to bytes (big-endian, 256 bytes)
         secret_bytes = shared_secret.to_bytes(256, byteorder="big")
-
-        # SHA-256 hash produces exactly 32 bytes = 256 bits = AES-256 key size
-        aes_key = hashlib.sha256(secret_bytes).digest()
-        return aes_key
+        return hashlib.sha256(secret_bytes).digest()
 
     @staticmethod
     def _validate_public_key(public_key: int) -> None:
         """
-        Validate a received public key before using it.
-
-        A malicious peer could send a crafted public key to force the
-        shared secret to a known value. We check:
-          - Key is in range [2, p-2] (excludes degenerate values 0, 1, p-1)
-          - Key satisfies Fermat's little theorem for our prime (key^((p-1)/2) mod p == 1)
-            This confirms the key is in the correct subgroup.
+        Validate received public key is in range [2, p-2] and in the
+        correct subgroup. Prevents small-subgroup confinement attacks.
         """
         if not (2 <= public_key <= DH_PRIME_P - 2):
-            raise ValueError(
-                f"Received public key is out of valid range [2, p-2]. "
-                f"Possible attack or implementation error."
-            )
-
-        # Subgroup check: for a safe prime p, (p-1)/2 is also prime.
-        # A valid key must satisfy key^((p-1)/2) ≡ 1 (mod p).
-        # This ensures the key is in the large prime-order subgroup,
-        # preventing small subgroup confinement attacks.
+            raise ValueError("Received public key is out of valid range [2, p-2].")
         order = (DH_PRIME_P - 1) // 2
         if pow(public_key, order, DH_PRIME_P) != 1:
-            raise ValueError(
-                "Received public key failed subgroup validation. "
-                "Key is not in the expected prime-order subgroup."
-            )
+            raise ValueError("Received public key failed subgroup validation.")
 
 
 # ─── Key serialisation helpers ────────────────────────────────────────────────
-#
-# Public keys are 2048-bit integers. We need to send them over the socket
-# as bytes. We use a fixed 256-byte big-endian encoding — always the same
-# size regardless of the key's value, which prevents length-based leakage.
 
 def int_to_bytes(n: int) -> bytes:
     """Serialise a DH public key (up to 2048-bit) to 256 bytes, big-endian."""
@@ -179,42 +108,161 @@ def bytes_to_int(b: bytes) -> int:
     return int.from_bytes(b, byteorder="big")
 
 
+# ─── PKCS#7 Padding ───────────────────────────────────────────────────────────
+
+def pkcs7_pad(data: bytes) -> bytes:
+    """
+    Apply PKCS#7 padding to make data a multiple of AES_BLOCK_SIZE (16 bytes).
+
+    How it works:
+      - Calculate how many bytes are needed to reach the next 16-byte boundary
+      - Append that many bytes, each with the numeric value of the pad length
+      - If data is already a multiple of 16, append a full 16-byte padding block
+        (so the receiver can always unambiguously strip padding)
+
+    Example:
+      data = b"HELLO" (5 bytes)
+      pad_len = 16 - (5 % 16) = 11
+      padded  = b"HELLO" + bytes([11] * 11)
+    """
+    pad_len = AES_BLOCK_SIZE - (len(data) % AES_BLOCK_SIZE)
+    return data + bytes([pad_len] * pad_len)
+
+
+def pkcs7_unpad(data: bytes) -> bytes:
+    """
+    Remove PKCS#7 padding after decryption.
+
+    The last byte tells us how many padding bytes were appended.
+    We validate all padding bytes have the correct value before stripping —
+    a padding oracle attack exploits implementations that don't validate this.
+
+    Raises ValueError if padding is malformed (possible tampering).
+    """
+    if not data:
+        raise ValueError("Cannot unpad empty data")
+
+    pad_len = data[-1]  # Last byte = padding length
+
+    # Sanity check: padding length must be 1–16
+    if pad_len < 1 or pad_len > AES_BLOCK_SIZE:
+        raise ValueError(f"Invalid PKCS#7 padding length: {pad_len}")
+
+    # Verify every padding byte has the correct value
+    padding = data[-pad_len:]
+    if padding != bytes([pad_len] * pad_len):
+        raise ValueError("Invalid PKCS#7 padding — data may have been tampered with")
+
+    return data[:-pad_len]
+
+
+# ─── AES-256-CBC Encryption / Decryption ─────────────────────────────────────
+#
+# We use pycryptodome (imported as Crypto) for the raw AES block operations.
+# The CBC chaining logic is handled by pycryptodome's CBC mode.
+# The IV generation, padding, and framing are our responsibility.
+
+def aes_encrypt(plaintext: bytes, key: bytes) -> bytes:
+    """
+    Encrypt plaintext using AES-256-CBC.
+
+    Steps:
+      1. Generate a random 16-byte IV (never reuse an IV with the same key)
+      2. Pad plaintext to a multiple of 16 bytes using PKCS#7
+      3. Encrypt with AES-256-CBC using key + IV
+      4. Prepend IV to ciphertext (receiver needs it to decrypt)
+
+    Wire format: [16-byte IV][ciphertext]
+
+    Args:
+        plaintext: raw bytes to encrypt (any length)
+        key:       32-byte AES-256 key (from DH key derivation)
+
+    Returns:
+        IV + ciphertext as a single bytes object
+    """
+    from Crypto.Cipher import AES  # pycryptodome
+
+    if len(key) != 32:
+        raise ValueError(f"AES-256 requires a 32-byte key, got {len(key)} bytes")
+
+    # Step 1: Fresh random IV for every encryption — critical for CBC security.
+    # Reusing an IV with the same key leaks XOR of the first plaintext blocks.
+    iv = os.urandom(AES_BLOCK_SIZE)
+
+    # Step 2: Pad to block boundary
+    padded = pkcs7_pad(plaintext)
+
+    # Step 3: Encrypt — pycryptodome handles the CBC XOR chaining internally
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    ciphertext = cipher.encrypt(padded)
+
+    # Step 4: Prepend IV so receiver can decrypt
+    return iv + ciphertext
+
+
+def aes_decrypt(ciphertext_with_iv: bytes, key: bytes) -> bytes:
+    """
+    Decrypt AES-256-CBC ciphertext produced by aes_encrypt().
+
+    Steps:
+      1. Split off the first 16 bytes as the IV
+      2. Decrypt the remainder with AES-256-CBC using key + IV
+      3. Strip PKCS#7 padding to recover original plaintext
+
+    Args:
+        ciphertext_with_iv: IV + ciphertext (as returned by aes_encrypt)
+        key:                32-byte AES-256 key (must match encryption key)
+
+    Returns:
+        Original plaintext bytes
+    """
+    from Crypto.Cipher import AES  # pycryptodome
+
+    if len(key) != 32:
+        raise ValueError(f"AES-256 requires a 32-byte key, got {len(key)} bytes")
+
+    if len(ciphertext_with_iv) < AES_BLOCK_SIZE:
+        raise ValueError("Ciphertext too short to contain IV")
+
+    # Step 1: Extract IV from the first 16 bytes
+    iv         = ciphertext_with_iv[:AES_BLOCK_SIZE]
+    ciphertext = ciphertext_with_iv[AES_BLOCK_SIZE:]
+
+    # Step 2: Decrypt
+    cipher    = AES.new(key, AES.MODE_CBC, iv)
+    padded    = cipher.decrypt(ciphertext)
+
+    # Step 3: Strip padding
+    plaintext = pkcs7_unpad(padded)
+
+    return plaintext
+
+
 # ─── Handshake orchestration ──────────────────────────────────────────────────
 
 def perform_handshake_sender(sock) -> bytes:
     """
     Sender side of the DH handshake.
-
-    Message flow:
-        Sender  -->  public_key_A  -->  Receiver
-        Sender  <--  public_key_B  <--  Receiver
-        (both compute shared secret independently)
-        (both derive identical AES key)
-
-    Returns:
-        32-byte AES key derived from the shared secret.
+    Returns 32-byte AES key derived from the shared secret.
     """
-    from peer import send_bytes, recv_bytes  # Import here to avoid circular import
+    from peer import send_bytes, recv_bytes
 
     dh = DiffieHellman()
 
-    # Step 1: Send our public key to the receiver
     our_public_key = dh.get_public_key()
     print("[*] DH: Sending public key to receiver...")
     send_bytes(sock, int_to_bytes(our_public_key))
 
-    # Step 2: Receive the receiver's public key
     their_public_key_bytes = recv_bytes(sock)
     their_public_key = bytes_to_int(their_public_key_bytes)
     print("[*] DH: Received receiver's public key")
 
-    # Step 3: Compute shared secret — this value is NEVER sent over the network
     shared_secret = dh.compute_shared_secret(their_public_key)
     print("[*] DH: Shared secret computed")
 
-    # Step 4: Derive AES key from shared secret
     aes_key = dh.derive_aes_key(shared_secret)
-    print(f"[+] DH: AES key derived — {aes_key.hex()[:16]}... (first 8 bytes shown)")
+    print(f"[+] DH: AES-256 key derived — {aes_key.hex()[:16]}... (first 8 bytes shown)")
 
     return aes_key
 
@@ -222,33 +270,24 @@ def perform_handshake_sender(sock) -> bytes:
 def perform_handshake_receiver(sock) -> bytes:
     """
     Receiver side of the DH handshake.
-
-    Mirror image of perform_handshake_sender — receives first, then sends.
-
-    Returns:
-        32-byte AES key derived from the shared secret.
-        This will be identical to the key derived by the sender.
+    Returns 32-byte AES key — identical to the sender's derived key.
     """
-    from peer import send_bytes, recv_bytes  # Import here to avoid circular import
+    from peer import send_bytes, recv_bytes
 
     dh = DiffieHellman()
 
-    # Step 1: Receive the sender's public key
     their_public_key_bytes = recv_bytes(sock)
     their_public_key = bytes_to_int(their_public_key_bytes)
     print("[*] DH: Received sender's public key")
 
-    # Step 2: Send our public key to the sender
     our_public_key = dh.get_public_key()
     print("[*] DH: Sending public key to sender...")
     send_bytes(sock, int_to_bytes(our_public_key))
 
-    # Step 3: Compute shared secret
     shared_secret = dh.compute_shared_secret(their_public_key)
     print("[*] DH: Shared secret computed")
 
-    # Step 4: Derive AES key
     aes_key = dh.derive_aes_key(shared_secret)
-    print(f"[+] DH: AES key derived — {aes_key.hex()[:16]}... (first 8 bytes shown)")
+    print(f"[+] DH: AES-256 key derived — {aes_key.hex()[:16]}... (first 8 bytes shown)")
 
     return aes_key
