@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 secure-p2p — Encrypted P2P File Sharing CLI Tool
-Stage 3: AES-256-CBC encryption wired into file transfer
+Stage 4: Progress bar with speed and ETA via tqdm
 
 Usage:
     Receive mode: python3 peer.py receive [--port PORT]
@@ -13,19 +13,15 @@ import struct
 import os
 import sys
 import argparse
-from crypto_utils import (
-    perform_handshake_sender,
-    perform_handshake_receiver,
-    aes_encrypt,
-    aes_decrypt,
-)
+
+from crypto_utils import perform_handshake_sender, perform_handshake_receiver
+from transfer import send_file, receive_file
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 DEFAULT_PORT  = 9999
-CHUNK_SIZE    = 65536   # 64 KB per chunk
-HEADER_FORMAT = ">Q"    # Big-endian unsigned 64-bit integer (8 bytes)
+HEADER_FORMAT = ">Q"
 HEADER_SIZE   = struct.calcsize(HEADER_FORMAT)
 
 
@@ -61,74 +57,6 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
-# ─── File transfer (AES-256-CBC encrypted) ────────────────────────────────────
-
-def send_file(sock: socket.socket, filepath: str, aes_key: bytes) -> None:
-    """
-    Send a file over an established socket connection, encrypted with AES-256-CBC.
-
-    What gets encrypted:
-      - The filename (so even the filename is private)
-      - Every chunk of file data
-
-    What stays plaintext:
-      - The file size (receiver needs this to know when transfer is complete)
-        In a production system you'd encrypt this too and use authenticated
-        encryption (AES-GCM) — noted in README security considerations.
-    """
-    filename = os.path.basename(filepath)
-    filesize = os.path.getsize(filepath)
-
-    print(f"[*] Sending '{filename}' ({filesize:,} bytes) — AES-256-CBC encrypted")
-
-    # Encrypt and send filename
-    send_bytes(sock, aes_encrypt(filename.encode("utf-8"), aes_key))
-
-    # Send file size plaintext (needed for progress tracking)
-    send_bytes(sock, struct.pack(HEADER_FORMAT, filesize))
-
-    # Encrypt and send file data chunk by chunk
-    bytes_sent = 0
-    with open(filepath, "rb") as f:
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            encrypted_chunk = aes_encrypt(chunk, aes_key)
-            send_bytes(sock, encrypted_chunk)
-            bytes_sent += len(chunk)
-            print(f"\r[*] Progress: {bytes_sent:,} / {filesize:,} bytes", end="", flush=True)
-
-    print(f"\n[+] File sent and encrypted successfully: {bytes_sent:,} bytes")
-
-
-def receive_file(sock: socket.socket, aes_key: bytes, save_dir: str = ".") -> str:
-    """
-    Receive and decrypt a file from an established socket connection.
-    """
-    # Decrypt filename
-    filename = aes_decrypt(recv_bytes(sock), aes_key).decode("utf-8")
-
-    # Receive plaintext file size
-    (filesize,) = struct.unpack(HEADER_FORMAT, recv_bytes(sock))
-
-    print(f"[*] Receiving '{filename}' ({filesize:,} bytes) — decrypting AES-256-CBC")
-
-    save_path      = os.path.join(save_dir, f"received_{filename}")
-    bytes_received = 0
-
-    with open(save_path, "wb") as f:
-        while bytes_received < filesize:
-            encrypted_chunk = recv_bytes(sock)
-            chunk = aes_decrypt(encrypted_chunk, aes_key)
-            f.write(chunk)
-            bytes_received += len(chunk)
-            print(f"\r[*] Progress: {bytes_received:,} / {filesize:,} bytes", end="", flush=True)
-
-    print(f"\n[+] File received and decrypted: {save_path}")
-    return save_path
-
-
 # ─── Receive mode ─────────────────────────────────────────────────────────────
 
 def run_receiver(port: int) -> None:
@@ -145,7 +73,7 @@ def run_receiver(port: int) -> None:
 
         with conn:
             aes_key = perform_handshake_receiver(conn)
-            receive_file(conn, aes_key)
+            receive_file(conn, aes_key)         # ← now from transfer.py
 
     except KeyboardInterrupt:
         print("\n[!] Receiver stopped by user")
@@ -170,7 +98,7 @@ def run_sender(filepath: str, host: str, port: int) -> None:
 
         with sock:
             aes_key = perform_handshake_sender(sock)
-            send_file(sock, filepath, aes_key)
+            send_file(sock, filepath, aes_key)  # ← now from transfer.py
 
     except ConnectionRefusedError:
         print(f"[!] Connection refused — is the receiver running on {host}:{port}?")
