@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# C build artifacts
+c/*.o
+c/peer_c
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+*.tmp
+received_*
