@@ -1,0 +1,6 @@
+# secure-p2p Python dependencies
+# Stage 1 uses only stdlib — no installs needed yet
+# Added here for completeness; tqdm added in Stage 4
+
+tqdm>=4.66.0
+pycryptodome>=3.20.0
